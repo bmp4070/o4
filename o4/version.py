@@ -1,15 +1,15 @@
 
 # This file is generated, do not modify
 
-import datetime.datetime
+import datetime
 
-VERSION = (1, 2, 5)
-VERSION_STR = '1.2.5'
+VERSION = (1, 3, 0)
+VERSION_STR = '1.3.0'
 PRODUCT = 'o4/version.py'
 
 REQ_MD5 = '43a9b7190217ebf4434beeb068e7a833'
-PY_MD5 = '4e3078c7a425b0e2a76b9eb830fa2c82'
+PY_MD5 = '938c0ac2e9f1a21136fc734471eb24d3'
 
-TIMESTAMP = datetime.datetime(2019, 4, 3, 15, 20, 26, 504013)
-USER_NAME = 'Clarence'
-USER_EMAIL = 'clarence.gardner@salesforce.com'
+TIMESTAMP = datetime.datetime(2020, 12, 7, 7, 56, 20, 588334)
+USER_NAME = 'Philip Bergen'
+USER_EMAIL = 'pbergen@salesforce.com'

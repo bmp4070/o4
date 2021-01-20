@@ -2,18 +2,24 @@
 """
 Usage:
   o4 sync <path> [-v] [-q] [-f] [+o] [-S <seed>] [-s <seed> [--move]] [-m <ignored>]
+  o4 status <path> [-f] [-q]
   o4 clean <path> [-v] [-q] [--resume] [--discard]
-  o4 fstat <paths>... [-q] [-f] [--changed <previous>] [--drop <fname>] [--keep <fname>] [--report <report>]
+  o4 fstat <paths>... [-v] [-q] [-f] [--changed <previous>] [--drop <fname>] [--keep <fname>] [--report <report>] [--add <fname>]...
   o4 seed-from <dir> [--fstat <fstat>] [--move]
-  o4 (drop|keep|keep-any) [-v] [--case|--not-case] [--open|--not-open] [--existence|--not-existence] [--checksum|--not-checksum] [--deletes|--not-deletes]
+  o4 (drop|keep|keep-any) [-v] [--case|--not-case] [--open|--not-open] [--existence|--not-existence] [--checksum|--not-checksum] [--deletes|--not-deletes] [--deleted <fname>]...
   o4 drop --havelist
   o4 [-q] pyforce [--debug] [--no-rev] [--] <p4args>...
   o4 head <paths>...
   o4 progress
   o4 fail
+  o4 version [--at-least <compare>]
 
 Option:
   sync          Sync/verify <path>.
+  status        Similar to git status, verifies the files in <path> against fstat records. By
+                default only files that are supposed to exist are checked, to check all files,
+                provide -f. For a faster check from 80% of current changelist,
+                add -q (recommended).
   clean         Clean <path>.
   <path>        Specify perforce style path, optionally specify "@changelist", if not given, head
                 will be determined. If path is a directory, "/..." is implied.
@@ -28,6 +34,7 @@ Option:
   --changed <previous>  Only output fstat for changes in (<previous>,<changelist>]
   --drop <fname>  Remove fstat with path listed in <fname>.
   --keep <fname>  Only keep fstat with path listed in <fname>.
+  --add <fname>  Create dummy entry for fname to help with unsbmitted renames.
   --report <report>  Print the report string with interpolated values after the fstat operation.
   seed-from     Copy files from the seed directory if they match what we want from Perforce.
                 If the named fstat file exists in the seed's .o4, it will be used, otherwise
@@ -50,6 +57,7 @@ Option:
   --deletes        Filter fstat lines that are deletes.
   --not-deletes    Opposite of --deletes
   --havelist       Filter files that are at the revision that the "have" data says they should be.
+  --deleted <fname>  Drops named files if they are deleted (does not exist).
   -q            Skip second pass for sync, or for pyforce/fstat to be quiet.
   -f            Force all files to be verified and synced.
   +o            Do not sync open files.
@@ -61,6 +69,9 @@ Option:
   <paths>       List of paths to visit.
   progress      Show progress based on .o4/.fstat.
   fail          Fails if there were fstat on stdin.
+  version       Display version information.
+  --at-least <compare>    Exits with error status if this version is older than <compare>,
+                supplied as maj.min.patch (i.e., it implies an update is called for).
   -v            Be verbose.
   -m <ignored>  Compatibility with old o4, just added to not break, not actually implementing
                 anything and will be removed as soon as old o4 is gone.
@@ -74,30 +85,36 @@ Note: Although all these commands are available to use, the common users is expe
 import os
 import sys
 import time
-import functools
+from functools import partial
 
 from subprocess import check_call, check_output, CalledProcessError, DEVNULL
 from signal import SIGINT
 from errno import EPERM
 import shutil
 
-err_print = functools.partial(print, file=sys.stderr)
+err_print = partial(print, file=sys.stderr)
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from o4_pyforce import Pyforce, P4Error, P4TimeoutError, info as pyforce_info, \
     client as pyforce_client, clear_cache
 from o4_fstat import fstat_from_csv, fstat_iter, fstat_path, \
-    fstat_split, fstat_join, get_fstat_cache, F_REVISION, F_FILE_SIZE, F_CHECKSUM, F_PATH
+    fstat_split, fstat_join, get_fstat_cache, \
+    F_REVISION, F_FILE_SIZE, F_CHECKSUM, F_PATH, F_CHANGELIST
 from o4_progress import progress_iter, progress_show, progress_enabled
 from o4_utils import chdir, consume, o4_log, caseful_accurate
 
 CLR = '%c[2K\r' % chr(27)
 
+SYNCED_CL_FILE = '.o4/changelist'
+
 
 def find_o4bin():
     # "Why not just use which?" "Sparse docker base images."
     import stat
+    import os.path
+    if os.path.dirname(sys.argv[0]):
+        return os.path.abspath(sys.argv[0])
     for d in os.environ['PATH'].split(':'):
         try:
             path = os.path.join(d, 'o4')
@@ -119,6 +136,37 @@ def _depot_path():
         os.environ['DEPOT_PATH'] = os.path.dirname(
             Pyforce.unescape(list(Pyforce('where', 'dummy'))[0]['depotFile']))
     return os.environ['DEPOT_PATH']
+
+
+def _client_path():
+    """
+    Returns the path that will be the prefix of any clientspec path.
+    I.e., a client path from Perforce will be that prefix plus the relative
+    path to the file.
+    Result is cached in env var $CLIENT_PATH.
+    """
+    if 'CLIENT_PATH' not in os.environ:
+        os.environ['CLIENT_PATH'] = os.path.dirname(
+            Pyforce.unescape(list(Pyforce('where', 'dummy'))[0]['clientFile']))
+    return os.environ['CLIENT_PATH']
+
+
+def client_path_to_depot_path(path):
+    if path.startswith(_client_path()):
+        dp = _depot_path().replace('/...', '')
+        return path.replace(_client_path(), dp)
+    return None
+
+
+def p4_operation(path, revision):
+    """
+    Returns the operation that was done for the path/revision recorded
+    in fstat. Returns the empty string if unable to find it.
+    """
+    recs = list(Pyforce('fstat', f'{path}#{revision}'))
+    if not recs:
+        return ''
+    return Pyforce.unescape(recs[0]['headAction'])
 
 
 def o4_seed_from(seed_dir, seed_fstat, op):
@@ -145,7 +193,7 @@ def o4_seed_from(seed_dir, seed_fstat, op):
         except IOError as e:
             print(f'# ERROR MOVING {src}: {e!r}')
 
-    fsop = shutil.move if op == 'move' else shutil.copy2
+    fsop = shutil.move if op == 'move' else partial(shutil.copy2, follow_symlinks=False)
 
     seed_checksum = None
     if seed_fstat:
@@ -155,6 +203,9 @@ def o4_seed_from(seed_dir, seed_fstat, op):
     target_dir = os.getcwd()
     with chdir(seed_dir):
         for line in sys.stdin:
+            if line.startswith('#o4pass'):
+                print(line, end='')
+                continue
             f = fstat_split(line)
             if not f:
                 continue
@@ -169,16 +220,27 @@ def o4_seed_from(seed_dir, seed_fstat, op):
                             os.unlink(dest)
                         else:
                             raise
+                if f[F_FILE_SIZE].endswith('symlink'):
+                    update_target(f[F_PATH], dest, fsop)
+                    continue
                 if seed_fstat:
                     checksum = seed_checksum.get(f[F_PATH])
                 else:
                     checksum = Pyforce.checksum(f[F_PATH], f[F_FILE_SIZE])
-                if f[F_FILE_SIZE].endswith('symlink') or checksum == f[F_CHECKSUM]:
+                if checksum == f[F_CHECKSUM]:
                     update_target(f[F_PATH], dest, fsop)
+                    continue
             print(line, end='')  # line already ends with '\n'
 
 
-def o4_fstat(changelist, previous_cl, drop=None, keep=None, quiet=False, force=False):
+def o4_fstat(changelist,
+             previous_cl,
+             drop=None,
+             keep=None,
+             quiet=False,
+             force=False,
+             add=None,
+             verbose=False):
     """
     changelist: Target changelist
     previous_cl: Previous_cl if known (otherwise 0)
@@ -188,6 +250,8 @@ def o4_fstat(changelist, previous_cl, drop=None, keep=None, quiet=False, force=F
           to limit output to
     force: output all fstat lines even though previous_cl is set. This only affects
            fstat when previous_cl is more recent than changelist (reverse sync).
+    add: Create dummy entries from this list,
+    verbose: Output stats on stderr after all fstat is listed.
 
     Missing fstat files for changelist and previous_cl are generated automatically.
 
@@ -226,26 +290,29 @@ def o4_fstat(changelist, previous_cl, drop=None, keep=None, quiet=False, force=F
 
     KEEP: Limit fstat from the stream to paths listed in the
           keep-file.
+
+    ADD:  Creates dummy entries for the given file to facilitate unsibmitted
+          renames between revisions.
     """
 
     if os.environ.get('DEBUG', ''):
-        print(
-            f"""# o4 fstat {os.getcwd()}
+        print(f"""# o4 fstat {os.getcwd()}
 # changelist: {changelist}
 # previous_cl: {previous_cl}
 # drop: {drop}
 # keep: {keep}
 # quiet: {quiet}""",
-            file=sys.stderr)
-    o4_log(
-        'fstat',
-        _depot_path(),
-        changelist=changelist,
-        previous_cl=previous_cl,
-        drop=drop,
-        keep=keep,
-        quiet=quiet,
-        force=force)
+              file=sys.stderr)
+    o4_log('fstat',
+           _depot_path(),
+           changelist=changelist,
+           previous_cl=previous_cl,
+           drop=drop,
+           keep=keep,
+           quiet=quiet,
+           force=force,
+           add=add,
+           verbose=verbose)
 
     if previous_cl:
         previous_cl = int(previous_cl)
@@ -268,6 +335,8 @@ def o4_fstat(changelist, previous_cl, drop=None, keep=None, quiet=False, force=F
     if keep:
         with open(keep, 'rt', encoding='utf8') as fin:
             keep = set(f[:-1] for f in fin)
+    for fname in add:
+        print(f"{changelist},{fname.replace(',', ';.')},USECL,0,DEADFACEDEADFACEDEADFACEDEADFACE")
 
     if previous_cl and previous_cl > changelist:
         # Syncing backwards requires us to delete files that were added
@@ -275,18 +344,16 @@ def o4_fstat(changelist, previous_cl, drop=None, keep=None, quiet=False, force=F
         # be synced to their state at the lower changelist.
         past_filenames = set(p for p, _ in map(
             fstat_path,
-            progress_iter(
-                fstat_iter(_depot_path(), changelist),
-                os.getcwd() + '/.o4/.fstat', 'fstat-reverse')) if p)
+            progress_iter(fstat_iter(_depot_path(), changelist),
+                          os.getcwd() + '/.o4/.fstat', 'fstat-reverse')) if p)
         if not keep:
             keep = set()
         if not drop:
             drop = set()
         for f in map(
                 fstat_split,
-                progress_iter(
-                    fstat_iter(_depot_path(), previous_cl, changelist),
-                    os.getcwd() + '/.o4/.fstat', 'fstat-reverse')):
+                progress_iter(fstat_iter(_depot_path(), previous_cl, changelist),
+                              os.getcwd() + '/.o4/.fstat', 'fstat-reverse')):
             if not f:
                 continue
             if f[F_PATH] not in past_filenames:
@@ -311,13 +378,18 @@ def o4_fstat(changelist, previous_cl, drop=None, keep=None, quiet=False, force=F
     if not keep:
         keep = None
 
-    fstats = progress_iter(
-        fstat_iter(_depot_path(), changelist, previous_cl),
-        os.getcwd() + '/.o4/.fstat', 'fstat')
+    fstats = progress_iter(fstat_iter(_depot_path(), changelist, previous_cl),
+                           os.getcwd() + '/.o4/.fstat', 'fstat')
     # Can't break out of fstat_iter without risking that the local
     # cache is not created, causing fstat_from_perforce to be called
     # twice, so we use an iterator that we can drain.
+    n_fstats = 0
+    n_deleted = 0
     for line in fstats:
+        if verbose:
+            n_fstats += 1
+            if line.endswith(','):
+                n_deleted += 1
         if keep is not None or drop is not None:
             path, line = fstat_path(line)
             if not path:
@@ -342,6 +414,8 @@ def o4_fstat(changelist, previous_cl, drop=None, keep=None, quiet=False, force=F
                     break
         print(line)
     actual_cl, fname = get_fstat_cache(changelist)
+    if verbose:
+        print({'files': n_fstats, 'deleted': n_deleted}, file=sys.stderr)
     return actual_cl
 
 
@@ -353,6 +427,9 @@ def o4_drop_have(verbose=False):
     # We have to wait with pulling the server havelist until we have the input in its entirety
     lines = sys.stdin.read().splitlines()
     for line in lines:
+        if line.startswith('#o4pass'):
+            print(line)
+            continue
         if not have:
             if have is not None:
                 print(line)
@@ -385,8 +462,6 @@ def o4_drop_have(verbose=False):
 
 
 def o4_filter(filtertype, filters, verbose):
-    from functools import partial
-
     # Each function implements a filter. It is called with an Fstat tuple.
     # If it "likes" the row (e.g., "checksum" likes the row if the checksum
     # matches the local file's checksum), it returns the row; otherwise it
@@ -417,6 +492,15 @@ def o4_filter(filtertype, filters, verbose):
         return (os.path.lexists(row[F_PATH]) and
                 not os.path.isdir(row[F_PATH])) == bool(row[F_CHECKSUM])
 
+    def f_existence(row):
+        """
+        Returns True if the file presence matches the fstat. That is True
+        if fstat says 'delete' and file is missing or True if fstat is
+        not 'delete' and file exists.
+        """
+        return (os.path.lexists(row[F_PATH]) and
+                not os.path.isdir(row[F_PATH])) == bool(row[F_CHECKSUM])
+
     def f_checksum(row):
         if os.path.lexists(row[F_PATH]):
             if not row[F_CHECKSUM]:  # File is deleted
@@ -433,6 +517,16 @@ def o4_filter(filtertype, filters, verbose):
         if invert:
             return f"not({fname})"
         return fname
+
+    named_deleted = []
+    for fname, doit, _ in filters:
+        if doit and fname == 'deleted':
+            named_deleted.extend(doit)
+
+    def f_deleted(row, fnames=named_deleted):
+        if row[F_PATH] in fnames:
+            return not os.path.exists(row[F_PATH])
+        return False
 
     funcs = [inverter(f'f_{fname}(x)', invert) for fname, doit, invert in filters if doit]
     if not funcs:
@@ -460,7 +554,11 @@ def o4_filter(filtertype, filters, verbose):
         sys.exit(f"*** ERROR: Invalid filtertype: {filtertype}")
 
     try:
-        for row in map(fstat_split, sys.stdin):
+        for line in sys.stdin:
+            if line.startswith('#o4pass'):
+                print(line, end='')
+                continue
+            row = fstat_split(line)
             if row:
                 if combo_func(row):
                     print(fstat_join(row))
@@ -488,27 +586,39 @@ def o4_pyforce(debug, no_revision, args: list, quiet=False):
 
     tmpf = NamedTemporaryFile(dir='.o4')
     fstats = []
-    for f in map(fstat_split, sys.stdin.read().splitlines()):
+    for line in sys.stdin.read().splitlines():
+        if line.startswith('#o4pass'):
+            print(line)
+            continue
+        f = fstat_split(line)
         if f and caseful_accurate(f[F_PATH]):
             fstats.append(f)
         elif f:
-            print(
-                f"*** WARNING: Pyforce is skipping {f[F_PATH]} because it is casefully",
-                "mismatching a local file.",
-                file=sys.stderr)
+            print(f"*** WARNING: Pyforce is skipping {f[F_PATH]} because it is casefully",
+                  "mismatching a local file.",
+                  file=sys.stderr)
     retries = 3
     head = _depot_path().replace('/...', '')
+    client_head = _client_path().replace('/...', '')
     while fstats:
         if no_revision:
             p4paths = [Pyforce.escape(f[F_PATH]) for f in fstats]
         else:
-            p4paths = [f"{Pyforce.escape(f[F_PATH])}#{f[F_REVISION]}" for f in fstats]
+            p4paths = []
+            for f in fstats:
+                rev = f[F_REVISION]
+                if rev == 'USECL':
+                    p4paths.append(f"{Pyforce.escape(f[F_PATH])}@{f[F_CHANGELIST]}")
+                else:
+                    p4paths.append(f"{Pyforce.escape(f[F_PATH])}#{f[F_REVISION]}")
         tmpf.seek(0)
         tmpf.truncate()
-        not_yet = []
         pargs = []
         xargs = []
-        # This is a really bad idea, files are output to stdout before the actual
+        queued_prints = []  # Print the fstats after the p4 process has ended, because p4 marshals
+        # its objects before operation, as in "And for my next act... !"
+        # This premature printing leads to false checksum errors during sync.
+        # This is a really bad idea, p4 prints filenames before the actual
         # sync happens, causing checksum tests to start too early:
         #        if len(p4paths) > 30 and 'sync' in args:
         #            xargs.append('--parallel=threads=5')
@@ -548,15 +658,22 @@ def o4_pyforce(debug, no_revision, args: list, quiet=False):
                     continue
                 res_str = res.get('depotFile') or res.get('fromFile')
                 if not res_str and res.get('data'):
-                    res_str = head + '/' + res['data']
+                    res_str = client_path_to_depot_path(res['data']) or f'{head}/{res["data"]}'
+
                 if not res_str:
                     errs.append(res)
                     continue
                 res_str = Pyforce.unescape(res_str)
                 for i, f in enumerate(fstats):
-                    if f"{head}/{f[F_PATH]}" in res_str:
-                        repeats[f"{head}/{f[F_PATH]}"].append(res)
-                        not_yet.append(fstats.pop(i))
+                    path = f'{head}/{f[F_PATH]}'
+                    if path in res_str:
+                        repeats[path].append(res)
+                        fstats.pop(i)
+                        if res['code'] != 'mute':
+                            queued_prints.append(f)
+                        if '- resolve skipped' in res.get('data', ''):
+                            if p4_operation(path, f[F_REVISION]).startswith('move/'):
+                                print(f'#o4pass-err#But {path} was renamed')
                         break
                 else:
                     for f in repeats.keys():
@@ -570,6 +687,7 @@ def o4_pyforce(debug, no_revision, args: list, quiet=False):
                         errs.append(res)
             if errs:
                 raise LogAndAbort('Unexpected reply from p4')
+
             if len(p4paths) == len(fstats):
                 raise LogAndAbort('Nothing recognized from p4')
         except P4Error as e:
@@ -577,14 +695,15 @@ def o4_pyforce(debug, no_revision, args: list, quiet=False):
             for a in e.args:
                 if 'clobber writable file' in a['data']:
                     fname = a['data'].split('clobber writable file')[1].strip()
-                    print("*** WARNING: Saving writable file as .bak:", fname, file=sys.stderr)
                     if os.path.exists(fname + '.bak'):
                         now = time.time()
-                        print(f"*** WARNING: Moved previous .bak to {fname}.{now}", file=sys.stderr)
+                        print(f"#o4pass-info#Moved previous .bak to {fname}.bak.{now}")
                         os.rename(fname + '.bak', f'{fname}.bak.{now}')
+                    print(f"#o4pass-info#Writable file {fname} copied to .bak")
                     shutil.copy(fname, fname + '.bak')
                     os.chmod(fname, 0o400)
                 else:
+                    print(f"#o4pass-err#{a['data']}")
                     non_recoverable = True
             if non_recoverable:
                 raise
@@ -608,10 +727,7 @@ def o4_pyforce(debug, no_revision, args: list, quiet=False):
             sys.exit(f'{CLR}*** ERROR: {e}; detail in {fname}')
         finally:
             if not quiet:
-                for fstat in not_yet:
-                    # Printing the fstats after the p4 process has ended, because p4 marshals
-                    # its objects before operation, as in "And for my next act... !"
-                    # This premature printing leads to false checksum errors during sync.
+                for fstat in queued_prints:
                     print(fstat_join(fstat))
 
 
@@ -712,20 +828,28 @@ def o4_sync(changelist,
         try:
             check_call([
                 '/bin/bash', '-c', f'set -o pipefail;{timecmd}{cmd}' +
-                '|| (echo PIPESTATUS ${PIPESTATUS[@]} >.o4-pipefails; false)'
+                '|| (echo PIPESTATUS ${PIPESTATUS[@]} >.o4/pipefails; false)'
             ])
             print()
         except CalledProcessError:
             cwd = os.getcwd()
-            with open('.o4-pipefails') as f:
+            with open('.o4/pipefails') as f:
                 fails = f.readline().rstrip().split()[1:]
-                os.remove('.o4-pipefails')
+                os.remove('.o4/pipefails')
             cmd = cmd.split('|')
             msg = [f"{CLR}*** ERROR: Pipeline failed in {cwd}:"]
+            failures = []
             for status, cmd in zip(fails, cmd):
-                status = ' FAILED ' if status == '1' else ' OK     '
+                cmd = cmd.replace(o4bin, 'o4')
+                if status == '1':
+                    status = ' FAILED '
+                    failures.append(cmd)
+                else:
+                    status = ' OK     '
                 msg.append(f'{status} {cmd}')
-            err_print('\n'.join(msg))
+            # Print the process list only if something besides "fail" failed.
+            if len(failures) > 1 or not failures[0].endswith('o4 fail'):
+                err_print('\n'.join(msg))
             sys.exit(1)
 
     def gat(cmd):
@@ -758,50 +882,88 @@ def o4_sync(changelist,
             try:
                 previous_cl = int(fin.read().strip())
             except ValueError:
-                print(
-                    "{CLR}*** WARNING: {os.getcwd()}/.o4/changelist could not be read",
-                    file=sys.stderr)
+                print("{CLR}*** WARNING: {os.getcwd()}/.o4/changelist could not be read",
+                      file=sys.stderr)
 
-    o4_log(
-        'sync',
-        changelist=changelist,
-        previous_cl=previous_cl,
-        seed=seed,
-        seed_move=seed_move,
-        quick=quick,
-        force=force,
-        skip_opened=skip_opened,
-        verbose=verbose,
-        gatling=gatling,
-        manifold=manifold)
+    o4_log('sync',
+           changelist=changelist,
+           previous_cl=previous_cl,
+           seed=seed,
+           seed_move=seed_move,
+           quick=quick,
+           force=force,
+           skip_opened=skip_opened,
+           verbose=verbose,
+           gatling=gatling,
+           manifold=manifold)
 
     verbose = ' -v' if verbose else ''
     force = ' -f' if force else ''
     fstat = f"{o4bin} fstat{force} ...@{changelist}"
-    gatling_low = gat(f"gatling{verbose} -n 4")
+    gatling_low = gat(f"gatling{verbose} -m {256*1024} -n 4")
     if previous_cl and not force:
         fstat += f" --changed {previous_cl}"
         gatling_low = ''
     manifold_big = man(f"manifold{verbose} -m {10*1024*1024}")
-    gatling_verbose = gat(f"gatling{verbose}")
+    gatling_verbose = gat(f"gatling{verbose} -m {256*1024}")
     manifold_verbose = man(f"manifold{verbose}")
     progress = f"| {o4bin} progress" if sys.stdin.isatty() and progress_enabled() else ''
     pyforce = 'pyforce'  #pyforce = 'pyforce' + (' --debug --' if os.environ.get('DEBUG', '') else '')
-    casefilter = ' --case' if sys.platform == 'darwin' else ''
-    keep_case = f'| {o4bin} keep --case' if casefilter else ''
+    keep_case = f'| {o4bin} keep --case' if sys.platform == 'darwin' else ''
+    checksum_with_case = (f"| {manifold_big} {o4bin} drop --checksum"
+                          f"{keep_case}")
+
     if previous_cl == changelist and not force:
         print(f'*** INFO: {os.getcwd()} is already synced to {changelist}, use -f to force a'
               f' full verification.')
         return
 
+    if os.path.exists(SYNCED_CL_FILE):
+        os.remove(SYNCED_CL_FILE)
+
     has_open = list(Pyforce('opened', '...'))
+
+    # [{
+    #     'code': 'stat',
+    #     'depotFile': '//sandbox/t/a',
+    #     'clientFile': '//pbergen-ltm-blt/sandbox/t/a',
+    #     'movedFile': '//sandbox/t/b',
+    #     'rev': '1',
+    #     'haveRev': '2',
+    #     'action': 'move/delete',
+    #     'change': 'default',
+    #     'type': 'text',
+    #     'user': 'pbergen',
+    #     'client': 'pbergen-ltm-blt'
+    # }, {
+    #     'code': 'stat',
+    #     'depotFile': '//sandbox/t/b',
+    #     'clientFile': '//pbergen-ltm-blt/sandbox/t/b',
+    #     'movedFile': '//sandbox/t/a',
+    #     'rev': '2',
+    #     'haveRev': '2',
+    #     'action': 'move/add',
+    #     'change': 'default',
+    #     'type': 'text',
+    #     'user': 'pbergen',
+    #     'client': 'pbergen-ltm-blt'
+    # }]
+
     openf = NamedTemporaryFile(dir='.o4', mode='w+t')
     if has_open:
+        from shlex import quote as shquote
+        move_adds = []
+        move_deletes = []
+
         dep = _depot_path().replace('/...', '')
         print(f'*** INFO: Opened for edit in {dep}:')
         for i, p in enumerate(has_open):
             open_file_name = Pyforce.unescape(p['depotFile'])[len(dep) + 1:]
             print(open_file_name, file=openf)
+            if p['action'] == 'move/add':
+                move_adds.append(shquote(open_file_name))
+            if p['action'] == 'move/delete':
+                move_deletes.append(shquote(open_file_name))
             if i < 10:
                 print(f'*** INFO: --keeping {open_file_name}')
         if len(has_open) > 10:
@@ -809,13 +971,22 @@ def o4_sync(changelist,
         openf.flush()
 
         # Resolve before syncing in case there are unresolved files for other reasons
-        cmd = (f"{fstat} --keep {openf.name}"
-               f"| {gatling_verbose} -- {o4bin} {pyforce} --no-rev -- resolve -am"
-               f"| {o4bin} {pyforce} sync"
+        move_add = ''
+        if move_adds:
+            move_add = ' --add '.join([''] + move_adds)
+        move_delete = ''
+        if move_deletes:
+            move_delete = ' --deleted '.join([''] + move_deletes)
+            move_delete = f"| {o4bin} drop {move_delete}"
+
+        cmd = (f"{fstat} --keep {openf.name}{move_add}"
+               f"| {gatling_verbose} -- {o4bin} {pyforce} sync"
                f"| {gatling_verbose} -- {o4bin} {pyforce} --no-rev -- resolve -am"
                f"{progress}"
+               f"{move_delete}"
                f"| {o4bin} drop --existence"
                f"| {gatling_verbose} -- {o4bin} {pyforce} --no-rev -- revert"
+               f"{move_delete}"
                f"| {o4bin} drop --existence"
                f"| {o4bin} fail")
         # Unopened only from here on
@@ -828,24 +999,26 @@ def o4_sync(changelist,
         print(f"{CLR}*** INFO: There are no opened files.")
 
     quiet = '-q' if seed else ''
-    retry = (f"| {manifold_big} {o4bin} drop --checksum"
-             f"| {gatling_verbose} {o4bin} {quiet} {pyforce} sync -f"
+    retry = (f"| {gatling_verbose} {o4bin} {quiet} {pyforce} sync -f"
              f"| {manifold_big} {o4bin} drop --checksum"
              f"| {gatling_verbose} {o4bin} {quiet} {pyforce} sync -f"
              f"| {manifold_big} {o4bin} drop --checksum"
              f"| {o4bin} fail")
 
-    syncit = f"| {gatling_verbose} {o4bin} {quiet} {pyforce} sync{force}"
+    syncit = (f"{checksum_with_case}"
+              f"| {gatling_verbose} {o4bin} {quiet} {pyforce} sync{force}"
+              f"| {manifold_big} {o4bin} drop --checksum")
     if seed:
         syncit = f"| {manifold_verbose} {o4bin} seed-from {seed}"
-        _, seed_fstat = get_fstat_cache(10_000_000_000, seed + '/.o4')
-        if seed_fstat:
-            syncit += f" --fstat {os.path.abspath(seed_fstat)}"
+        if not list(Pyforce('opened', f'{seed}/...')):
+            _, seed_fstat = get_fstat_cache(10_000_000_000, seed + '/.o4')
+            if seed_fstat:
+                syncit += f" --fstat {os.path.abspath(seed_fstat)}"
         if seed_move:
             syncit += " --move"
+        syncit += keep_case
 
     cmd = (f"{fstat} | {o4bin} drop --not-deletes --existence"
-           f"{keep_case}"
            f"{progress}"
            f"{syncit}"
            f"{retry}")
@@ -859,14 +1032,14 @@ def o4_sync(changelist,
             print("*** INFO: Flushing took {:.2f} minutes".format((time.time() - t0) / 60))
 
     cmd = (f"{fstat} "
-           f"| {o4bin} drop --deletes --checksum"
-           f"{keep_case}"
+           f"| {o4bin} drop --deletes"
            f"{progress}"
+           f"{syncit}"
            f"{retry}")
     run_cmd(cmd)
 
     actual_cl, _ = get_fstat_cache(changelist)
-    with open('.o4/changelist', 'wt') as fout:
+    with open(SYNCED_CL_FILE, 'wt') as fout:
         print(actual_cl, file=fout)
 
     if seed or not quick:
@@ -885,6 +1058,120 @@ def o4_sync(changelist,
     if previous_cl == actual_cl and not force:
         print(f'*** INFO: {os.getcwd()} is already synced to {actual_cl}, use -f to force a'
               f' full verification.')
+
+
+def o4_status(changelist, depot, check_all, quick):
+    from subprocess import run, PIPE
+
+    o4bin = find_o4bin()
+    manibin = os.path.join(os.path.dirname(o4bin), 'manifold')
+    here = os.getcwd()
+    depot = depot.rstrip('.')
+
+    print(f"*** INFO: o4 status {here}")
+    if not os.path.isdir('.o4'):
+        print("Never synced with o4.")
+        return
+    try:
+        cur = int(open('.o4/changelist').read().strip())
+    except ValueError:
+        print("*** WARNING: .o4/changelist is invalid.")
+        cur = None
+    except FileNotFoundError:
+        print("*** WARNING: .o4/changelist is missing.")
+        cur = None
+    if cur is None:
+        cur, fname = get_fstat_cache(changelist)
+    o4_log('fstat', depot, changelist=changelist, cur=cur, check_all=check_all, quick=quick)
+    if not cur:
+        print("*** ERROR: Current changelist could not be determined.")
+        return
+
+    print(f"Current changelist: {cur:,d}")
+    print(f"  - HEAD is {changelist:,d} (+{changelist-cur:,d})")
+
+    os.environ['O4_PROGRESS'] = 'false'
+    keep_case = f'| {o4bin} keep --case' if sys.platform == 'darwin' else ''
+    drop_deleted = f"| grep -v ',$'" if not check_all else ''
+    changed = f" --changed {cur*4//5}" if quick else ''
+    cmd = (f"{o4bin} fstat -v .@{cur}{changed}{drop_deleted}"
+           f"| {manibin} {o4bin} drop --checksum{keep_case}")
+    print(f"Checksumming ({cmd.replace('/usr/local/bin/', '')}).")
+    if not check_all:
+        print("Skipping deleted files.")
+    if quick:
+        print(f"Skipping changes before changelist {cur*4//5:,d}.")
+    print("Please be patient...")
+    res = run(cmd, stdout=PIPE, stderr=PIPE, shell=True, universal_newlines=True)
+    crcs = {
+        f[F_PATH]: f
+        for f in sorted((fstat_split(f) for f in res.stdout.splitlines()), key=lambda x: x[F_PATH])
+    }
+    file_stats = eval([line for line in res.stderr.splitlines() if line.startswith('{')][0], {}, {})
+
+    has_open = {f['depotFile'].replace(depot, ''): f for f in Pyforce('opened', '...')}
+
+    # [{
+    #     'code': 'stat',
+    #     'depotFile': '//sandbox/t/a',
+    #     'clientFile': '//pbergen-ltm-blt/sandbox/t/a',
+    #     'movedFile': '//sandbox/t/b',
+    #     'rev': '1',
+    #     'haveRev': '2',
+    #     'action': 'move/delete',
+    #     'change': 'default',
+    #     'type': 'text',
+    #     'user': 'pbergen',
+    #     'client': 'pbergen-ltm-blt'
+    # }, {
+    naughty = set(crcs.keys()) - set(has_open.keys())
+    renamed = {
+        k: v['movedFile'].replace(depot, '')
+        for k, v in has_open.items()
+        if v.get('action') == 'move/delete'
+    }
+    missing = {f for f in crcs.keys() if f not in renamed and not os.path.exists(f)}
+    all_fnames = set(list(has_open.keys()) + list(crcs.keys()))
+    print(f"Files checked: {file_stats['files'] - (0 if check_all else file_stats['deleted']):,d}")
+
+    if all_fnames:
+        print("\nFiles with local modifications:")
+        print(" (!=Checksum fail A=Added D=Deleted M=Modified O=Open R=Renamed)\n")
+    else:
+        print("*** INFO: All files passed the checksum test and no files are open for edit.")
+        return True
+
+    for f in sorted(all_fnames):
+        ho = has_open.get(f, {})
+        if ho.get('action') == 'move/add':
+            continue
+
+        n = '!' if f in naughty else ' '
+        m = ' '
+        if f in missing:
+            m = 'D'
+        if f in crcs:
+            m = 'M'
+        r = ' '
+        fn = f
+        if f in renamed:
+            r = 'R'
+            c = crcs[f]
+            m = ' ' if Pyforce.checksum(renamed[f], c[F_FILE_SIZE]) == c[F_CHECKSUM] else 'M'
+            fn = f"{f} -> {renamed[f]}"
+        if ho.get('action') == 'add':
+            m = 'A'
+        if m == ' ' and f in has_open:
+            m = 'O'
+        print(f" {n}{r}{m}  {fn}")
+
+    if len(has_open) == len(all_fnames):
+        s = 's' if len(has_open) > 1 else ''
+        print("")
+        print(f"*** INFO: Besides the {len(has_open)} file{s} opened for edit, "
+              f"all files passed the checksum test.")
+
+    return True
 
 
 def get_clean_cl(opts):
@@ -913,18 +1200,24 @@ def o4_clean(changelist, quick=False, resume=False, discard=False):
     def move_except(from_dir, to_dir, but_not):
         with chdir(from_dir):
             for f in os.listdir('.'):
-                if f != but_not:
+                if f not in but_not:
                     shutil.move(f, f'{to_dir}/{f}')
 
     target = os.getcwd()
     source = f'{target}/.o4/cleaning'
+    cleaned = f'{target}/.o4/cleaned'
+    if rm_empty_dirs(cleaned):
+        print(f'*** ERROR: Unhandled files still exist from a previous clean run.')
+        print(f'           Please delete (if unwanted) or move files from {cleaned}')
+        print(f'           back to its place in {target}.')
+        sys.exit(1)
+
     if resume:
         if not os.path.exists(source):
             sys.exit(f'*** ERROR: Cannot resume cleaning; {source} does not exist.')
     else:
-        os.makedirs(f'{source}/.o4', exist_ok=True)
-        move_except(f'{target}/.o4', f'{source}/.o4', but_not='cleaning')
-        move_except(target, source, but_not='.o4')
+        os.makedirs(f'{source}', exist_ok=True)
+        move_except(target, source, but_not=['.o4'])
 
         dep = _depot_path().replace('/...', '')
         p4open = [
@@ -936,7 +1229,8 @@ def o4_clean(changelist, quick=False, resume=False, discard=False):
         for of in p4open:
             if os.path.dirname(of):
                 os.makedirs(os.path.dirname(of), exist_ok=True)
-            shutil.move(os.path.join(source, of), of)
+            if os.path.exists(os.path.join(source, of)):
+                shutil.move(os.path.join(source, of), of)
 
     os.chdir(target)
     o4bin = find_o4bin()
@@ -946,30 +1240,95 @@ def o4_clean(changelist, quick=False, resume=False, discard=False):
     check_call(cmd)
     if not discard:
         savedir = source.replace('cleaning', time.strftime('cleaned'))  # @%Y-%m-%d,%H:%M'))
+        if os.path.exists(savedir):
+            shutil.rmtree(savedir)
         shutil.move(source, savedir)
-        err_print(f'*** INFO: Directory is clean @{changelist}; detritus is in {savedir}')
+        if os.path.exists(f'{savedir}/.o4'):
+            shutil.rmtree(f'{savedir}/.o4')
+        n_files = rm_empty_dirs(savedir)
+        err_print(f'*** INFO: Directory is clean @{changelist}')
+        if n_files:
+            err_print(f'          {n_files} dirty files remain under {savedir}')
+        else:
+            err_print(f'          Congratulations! No dirty files left over.')
     else:
         assert source.endswith('cleaning')
         shutil.rmtree(source)
 
 
+def rm_empty_dirs(root):
+    '''
+    Given a directory tree, remove all directories that have only
+    directories beneath them. Return the number of non-directory files
+    remaining.
+    '''
+    nondirs = 0
+
+    def rmed(dname):
+        nonlocal nondirs
+        save_nondirs = nondirs
+        with chdir(dname):
+            for f in os.listdir('.'):
+                if os.path.isdir(f):
+                    if rmed(os.path.join(dname, f)):
+                        os.rmdir(os.path.join(dname, f))
+                else:
+                    nondirs += 1
+        return nondirs == save_nondirs
+
+    rmed(root)
+    return nondirs
+
+
 def o4_fail():
     files = []
+    errors = []
+    warnings = []
+    infos = []
     n = 0
-    for f in map(fstat_split, sys.stdin):
+    for line in sys.stdin:
+        if line.startswith('#o4pass-'):
+            msgtype, _, msg = line.replace('#o4pass-', '').partition('#')
+            if msgtype == 'info':
+                infos.append(msg)
+            elif msgtype == 'warn':
+                warnings.append(msg)
+            elif msgtype == 'err':
+                errors.append(msg)
+            continue
+        f = fstat_split(line)
         if not f:
             continue
         n += 1
         if n < 100:
             files.append(f"  {f[F_PATH]}#{f[F_REVISION]}")
+
+    if not files and not infos and not warnings and not errors:
+        sys.exit(0)
+
+    if infos:
+        err_print('*** INFO:\n\t', end='')
+        err_print('\n\t'.join(sorted(infos)))
+
+    if warnings:
+        err_print('*** WARNING:\n\t', end='')
+        err_print('\n\t'.join(sorted(warnings)))
+
     if files:
-        dash = '-' * 52
-        err_print(f"\n{CLR}*** ERROR: These files did not get synced correctly:\n{dash}")
+        err_print('These files did not sync')
         err_print('\n'.join(sorted(files)))
         if len(files) != n:
-            err_print(f"  ...and {n-len(files)} others!")
-        err_print(dash)
-        sys.exit(f"{CLR}*** ERROR: Pipeline ended with {n} fstat lines.")
+            err_print(f'  ...and {n-len(files)} others!')
+
+    if errors:
+        err_print('*** ERROR:\n\t', end='')
+        err_print('\n\t'.join(sorted(errors)))
+
+    if files or errors:
+        if n:
+            s = '' if n == 1 else 's'
+            err_print(f'{CLR}*** ERROR: Pipeline ended with {n} file{s} rejected.')
+        sys.exit(1)
 
 
 def o4_head(paths):
@@ -1008,10 +1367,9 @@ def o4_head(paths):
     for retry in range(3):
         try:
             end = '' if len(args) > 1 else args[0]
-            print(
-                f"# {CLR}*** INFO: ({retry+1}/3) Retrieving HEAD changelist for",
-                end,
-                file=sys.stderr)
+            print(f"# {CLR}*** INFO: ({retry+1}/3) Retrieving HEAD changelist for",
+                  end,
+                  file=sys.stderr)
             if not end:
                 for path in args:
                     print(f"      {path}")
@@ -1046,6 +1404,38 @@ def parallel_fstat(opts):
                           stdin=sin)
 
 
+def check_higher_sync(path):
+    '''
+    Exits with an error if any ancestor directory of the given
+    directory has a .o4 directory.
+    Stops at the home directory because that .o4 directory does
+    not hold syncing information.
+    '''
+    return 'Removing because of an apparent infinite loop'
+    from os.path import dirname, exists, join, expanduser
+
+    def newer_o4(d1, d2):
+        try:
+            s1 = os.stat(join(d1, '.o4', 'changelist'))
+            s2 = os.stat(join(d2, '.o4', 'changelist'))
+            return s1.st_mtime > s2.st_mtime
+        except:
+            return False
+
+    home = expanduser('~')
+    parent = dirname(path)
+    while parent != '/' and parent != home:
+        if exists(join(parent, '.o4')):
+            if newer_o4(path, parent):
+                try:
+                    os.remove(join(parent, '.o4', 'changelist'))
+                except:
+                    pass
+            sys.exit(
+                f'*** ERROR: o4 cannot sync {path}; parent directory {parent} has been synced.')
+        parent = dirname(parent)
+
+
 def add_implicit_args(args):
     import o4_config
 
@@ -1069,6 +1459,16 @@ def main():
         # marker so they are not parsed
         args.insert(args.index('pyforce') + 1, '--')
     opts = docopt(__doc__, args)
+
+    if opts['version']:
+        from version import VERSION, VERSION_STR, TIMESTAMP, USER_EMAIL, USER_NAME
+        if not opts['--at-least']:
+            print(VERSION_STR)
+            print(TIMESTAMP.strftime('%Y-%m-%d'), USER_EMAIL, USER_NAME)
+            sys.exit(0)
+        testver = opts['--at-least'].split('.')
+        testver = tuple([int(d) for d in (testver + [0, 0, 0])[:3]])
+        sys.exit(VERSION < testver)
 
     # Commands that don't parse a changelist
     ec = 0
@@ -1095,6 +1495,7 @@ def main():
                     ('case', opts['--not-case'], True),
                     ('open', opts['--open'], False),
                     ('open', opts['--not-open'], True),
+                    ('deleted', opts['--deleted'], False),
                 ), opts['-v'])
         if opts['pyforce']:
             ran = True
@@ -1137,6 +1538,7 @@ def main():
             print('*** WARNING: Could not parse @-revision, ignored.')
     opts['<path>'] = depot_abs_path(opts['<path>'])
     target = os.path.join(os.environ['CLIENT_ROOT'], opts['<path>'][2:])
+    check_higher_sync(target)
     o4dir = os.path.join(target, '.o4')
     opts['<path>'] = opts['<path>'] + '/...'
     if opts['-S'] and not opts['-s']:
@@ -1169,9 +1571,11 @@ def main():
     try:
         if opts['fstat']:
             actual_cl = o4_fstat(opts['@'], opts['--changed'], opts['--drop'], opts['--keep'],
-                                 opts['-q'], opts['-f'])
+                                 opts['-q'], opts['-f'], opts['--add'], opts['-v'])
             if opts['--report']:
                 print(opts['--report'].format(**locals()))
+        if opts['status']:
+            o4_status(opts['@'], opts['<path>'], opts['-f'], opts['-q'])
         if opts['sync']:
             if opts['-m']:
                 print("*** WARNING: sync -m is deprecated.")

@@ -1,4 +1,3 @@
-
 PYTHON:=venv/bin/python
 VULTURE:=venv/bin/vulture
 YAPF:=venv/bin/yapf
@@ -26,7 +25,7 @@ EXES:=build/o4 build/gatling build/manifold
 
 SHELL:=/bin/bash
 
-.PHONY: clean lint install uninstall
+.PHONY: clean lint install uninstall aws aws-staging
 
 all: lint $(EXES)
 
@@ -41,17 +40,17 @@ manifold/version.py: $(GATLING_SRC) $(MANIFOLD_SRC) versioning.py
 
 build/o4.za: $(O4_SRC) o4/version.py
 	mkdir -p $@
-	${PIP} install -r $< --target $@
+	${PIP} install -U -r $< --target $@
 	cp -a $^ $@
 
 build/gatling.za: $(GATLING_SRC) gatling/version.py
 	mkdir -p $@
-	${PIP} install -r $< --target $@
+	${PIP} install -U -r $< --target $@
 	cp -a $^ $@
 
 build/manifold.za: $(GATLING_SRC) $(MANIFOLD_SRC) manifold/version.py
 	mkdir -p $@
-	${PIP} install -r $< --target $@
+	${PIP} install -U -r $< --target $@
 	cp -a $^ $@
 
 build/%: build/%.za
@@ -73,12 +72,22 @@ install: $(EXES)
 uninstall: $(EXES)
 	rm -f $(foreach exe, $^, /usr/local/bin/$(notdir $(exe)))
 
+aws: $(EXES)
+	@echo "Uploading artifacts to PRODUCTION."
+	@$(foreach path, o4/o4_pyforce.py build/o4 build/manifold build/gatling,\
+	aws s3 cp $(path) s3://sfdc-ansible/o4/$(notdir $(path));)
+
+aws-staging:
+	@echo "Uploading artifacts to STAGING."
+	@$(foreach path, o4/o4_pyforce.py build/o4 build/manifold build/gatling,\
+	aws s3 cp $(path) s3://sfdc-ansible/o4-staging/$(notdir $(path));)
+
 lint: $(LINTS)
 
 venv:
 	python3 -m venv venv
 	${PIP} install --upgrade pip
-	${PIP} install -r requirements.txt
+	${PIP} install -U -r requirements.txt
 
 clean:
 	@echo "CLEAN --------------------------------------------"

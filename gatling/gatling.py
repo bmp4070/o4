@@ -14,7 +14,7 @@ is invoked or by an optional first argument (gatling|manifold):
  * gatling: best for commands that communicate with remote servers
    (e.g. p4)
 
- * manifold: best for commands that consume mainly local resources 
+ * manifold: best for commands that consume mainly local resources
    (e.g. md5)
 
 In manifold mode a child process is created for each block read, until
@@ -125,9 +125,9 @@ def distribute(cmd, max_bytes, max_procs, chunk_size, round_robin, verbose):
         n = 0
         while len(not_done) > 1 or list(selector.get_map()):
             for (fileobj, _, _, p), _ in selector.select():
-                chunk = fileobj.read(4096)
+                chunk = fileobj.read(chunk_size)
                 if chunk:
-                    i = chunk.rfind('\n') + 1
+                    i = chunk.rfind(b'\n') + 1
                     if i:
                         n += fileobj._trg.write(fileobj._buf)
                         n += fileobj._trg.write(chunk[:i])
@@ -152,14 +152,14 @@ def distribute(cmd, max_bytes, max_procs, chunk_size, round_robin, verbose):
     # a buffer to be written to a child.
     p_open = []
     b_in = 0
-    buf = ''
+    buf = b''
     not_done = [0, 1]
     sel_t = None
     t0 = time()
     try:
-        for chunk in iter(lambda: stdin.read(chunk_size), ''):
+        for chunk in iter(lambda: stdin.buffer.read(chunk_size), b''):
             b_in += len(chunk)
-            i = chunk.rfind('\n') + 1
+            i = chunk.rfind(b'\n') + 1
             if i:
                 p = None
                 if round_robin:
@@ -171,15 +171,14 @@ def distribute(cmd, max_bytes, max_procs, chunk_size, round_robin, verbose):
                 if not p:
                     if verbose:
                         running = len(p_filled) + len(p_open)
-                        print(
-                            f"# {my_name} STARTED A PROCESS (1 + {running} + {len(res)}):",
-                            *cmd,
-                            file=sys.stderr)
-                    p = Popen(cmd, encoding=stdout.encoding, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+                        print(f"# {my_name} STARTED A PROCESS (1 + {running} + {len(res)}):",
+                              *cmd,
+                              file=sys.stderr)
+                    p = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
                     p._n = 0
                     p._t0 = time()
-                    for fo, trg in [(p.stdout, stdout), (p.stderr, stderr)]:
-                        fo._buf = ''
+                    for fo, trg in [(p.stdout, stdout.buffer), (p.stderr, stderr.buffer)]:
+                        fo._buf = b''
                         fo._trg = trg
                         fcntl(fo, F_SETFL, fcntl(fo, F_GETFL) | O_NONBLOCK)
                         selector.register(fo, EVENT_READ, p)
@@ -200,23 +199,21 @@ def distribute(cmd, max_bytes, max_procs, chunk_size, round_robin, verbose):
                     p_filled.append(p)
                     if verbose and ptd and td:
                         running = len(p_filled) + len(p_open)
-                        print(
-                            f"# {my_name} PROCESS LIMIT {p._n:,}/{max_bytes:,}",
-                            f"({p._n/ptd:.2f} kb/s).",
-                            f"INPUT: {b_in:,} ({b_in/td:.2f} kb/s) OUTPUT: {not_done[0]:,}.",
-                            f"PROCESSES: {running}/{running+len(res)}",
-                            file=sys.stderr)
+                        print(f"# {my_name} PROCESS LIMIT {p._n:,}/{max_bytes:,}",
+                              f"({p._n/ptd:.2f} kb/s).",
+                              f"INPUT: {b_in:,} ({b_in/td:.2f} kb/s) OUTPUT: {not_done[0]:,}.",
+                              f"PROCESSES: {running}/{running+len(res)}",
+                              file=sys.stderr)
                     while len(p_filled) == max_procs:
                         done = [d for d in p_filled if d.poll() is not None]
                         if done and verbose:
                             print(f"# {my_name} CLOSED {len(done)} PROCESSES", file=sys.stderr)
                         for d in done:
                             if verbose and p._t0 != t1:
-                                print(
-                                    f"# {my_name} CLOSED PROCESS INPUT: {p._n:,} TIME:",
-                                    f"{t1-p._t0:.1f}/{t1-p._t1:.1f}",
-                                    f"KB/S: {p._n/(t1-p._t0)/1024:.2f}",
-                                    file=sys.stderr)
+                                print(f"# {my_name} CLOSED PROCESS INPUT: {p._n:,} TIME:",
+                                      f"{t1-p._t0:.1f}/{t1-p._t1:.1f}",
+                                      f"KB/S: {p._n/(t1-p._t0)/1024:.2f}",
+                                      file=sys.stderr)
                             p_filled.remove(d)
                             res.append(d.returncode)
                         if not done:
@@ -227,7 +224,7 @@ def distribute(cmd, max_bytes, max_procs, chunk_size, round_robin, verbose):
                 buf += chunk
         for p in p_open:
             p.stdin.write(buf)
-            buf = ''
+            buf = b''
             p.stdin.close()
             p_filled.append(p)
     except (KeyboardInterrupt, SystemExit):
@@ -238,8 +235,20 @@ def distribute(cmd, max_bytes, max_procs, chunk_size, round_robin, verbose):
         for d in p_filled:
             d.kill()
         raise
-    while p_filled:
-        res.append(p_filled.pop(0).wait())
+
+    if sys.platform == 'linux':
+        # This method, for unknown reasons, leads to busy wait and an explosion in
+        # CPU consumption on the mac
+        while p_filled:
+            res.append(p_filled.pop(0).wait())
+    else:
+        # This method, for unkown reasons, works on the mac and hangs on linux
+        while p_filled:
+            sleep(0.5)
+            tmp = [p.poll() for p in p_filled]
+            for i, rt in reversed(list(enumerate(tmp))):
+                if rt is not None:
+                    res.append(p_filled.pop(i).wait())
 
     if sel_t:
         not_done.pop()
